@@ -20,12 +20,17 @@ Standard library only. Python 3.8+.
 
 PAGE is a page/folder name from `list` (e.g. "Page 1", "Showtime") or a page UUID.
 SLOT is "col,row" counted from 0 at the top-left key.
+
+After remove/restore on macOS, the app's saved key count (last_app_session_report) is lowered
+to match, so it doesn't warn "error restoring the last session" on launch. SDECK_SKIP_PREFS=1
+skips that.
 """
 import argparse
 import copy as copymod
 import datetime as dt
 import json
 import os
+import plistlib
 import re
 import shutil
 import subprocess
@@ -38,6 +43,8 @@ APP_NAME = "Elgato Stream Deck"
 DEFAULT_ROOT = os.path.expanduser(
     "~/Library/Application Support/com.elgato.StreamDeck/ProfilesV3")
 DEFAULT_BACKUPS = os.path.expanduser("~/StreamDeckBackups")
+PREFS_DOMAIN = "com.elgato.StreamDeck"
+SESSION_KEY = "last_app_session_report"
 
 BUILTIN = {
     "open": ("Open", "com.elgato.streamdeck.system.open"),
@@ -50,9 +57,9 @@ SHELL_ACTION = "com.ceylon-systems.shell-commands.runner"
 FOLDER_ACTIONS = ("com.elgato.streamdeck.profile.openchild",)
 SLOT_RE = re.compile(r"^\d+,\d+$")
 
-COUNT_NOTE = ("note: the app counts keys at quit and compares on the next launch. Because this "
-              "lowers the count, it will show 'error restoring the last session' and offer its "
-              "own backup. Click Cancel to keep this layout; nothing was lost.")
+COUNT_NOTE = ("note: the app's saved key count wasn't updated. If this layout has fewer keys than "
+              "at the last quit, the app will show 'error restoring the last session' and offer "
+              "its own backup. Click Cancel to keep this layout; nothing was lost.")
 
 
 class SdeckError(Exception):
@@ -353,6 +360,56 @@ def do_restore(root, src, backups, keep=DEFAULT_KEEP):
     return safety
 
 
+# ---------------------------------------------------------------- app's saved key count
+
+def session_action_count(root):
+    """The number the app saves as last_app_session_report.action_count at quit and checks on
+    launch: every key (all controllers, nav keys too) on each profile's top-level pages
+    (Pages.Pages plus Pages.Default); keys inside folders don't count. Matched live data on app
+    7.6.1 (27 page keys + 70 folder keys -> 27), but only one profile was available to check,
+    so summing across profiles is an assumption."""
+    n = 0
+    for prof in load_profiles(root):
+        pages = prof.manifest.get("Pages") or {}
+        top = {u.lower() for u in pages.get("Pages") or []}
+        if pages.get("Default"):
+            top.add(pages["Default"].lower())
+        for pg in prof.pages:
+            if pg.uuid.lower() in top:
+                n += sum(len(c.get("Actions") or {}) for c in pg.data.get("Controllers") or [])
+    return n
+
+
+def sync_session_count(root):
+    """Lower the app's saved key count to match the edited profiles so it doesn't report data
+    loss on launch. Never raises the count and never raises. True if nothing is left to do."""
+    if os.environ.get("SDECK_SKIP_PREFS") == "1" or sys.platform != "darwin":
+        return False
+    try:
+        new = session_action_count(root)
+        r = subprocess.run(["defaults", "export", PREFS_DOMAIN, "-"],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if r.returncode:
+            raise SdeckError("defaults export exited %d" % r.returncode)
+        report = plistlib.loads(r.stdout).get(SESSION_KEY)
+        old = report.get("action_count") if isinstance(report, dict) else None
+        if not isinstance(old, int) or isinstance(old, bool):
+            raise SdeckError("no %s.action_count saved" % SESSION_KEY)
+        if old <= new:
+            return True
+        # -dict-add sets one key and keeps session_count and anything else in the dict.
+        r = subprocess.run(["defaults", "write", PREFS_DOMAIN, SESSION_KEY,
+                            "-dict-add", "action_count", "-int", str(new)],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if r.returncode:
+            raise SdeckError("defaults write exited %d" % r.returncode)
+        print("updated the app's saved key count %d -> %d so it won't warn on launch" % (old, new))
+        return True
+    except Exception as e:  # best effort: the edit itself already succeeded
+        print("note: couldn't check the app's saved key count (%s)" % e)
+        return False
+
+
 # ---------------------------------------------------------------- building actions
 
 def base_action(plugin_name, plugin_uuid, action_uuid, name, settings, title, plugin_version="1.0"):
@@ -553,7 +610,8 @@ def cmd_remove(a):
     del acts[slot]
     page.save()
     print("removed %s from %r" % (slot, page.name))
-    print(COUNT_NOTE)
+    if not sync_session_count(a.root):
+        print(COUNT_NOTE)
 
 
 def cmd_backup(a):
@@ -577,8 +635,8 @@ def cmd_restore(a):
     print("current state saved to %s first"
           % do_restore(a.root, a.backup_dir, a.backups, a.keep_backups))
     print("restored %s. Run `sdeck.py launch`." % a.backup_dir)
-    print(COUNT_NOTE.replace("Because this lowers", "If the restored layout has fewer keys, it lowers")
-          .replace("it will show", "and the app will show"))
+    if not sync_session_count(a.root):
+        print(COUNT_NOTE)
 
 
 def cmd_quit(a):
