@@ -2,7 +2,7 @@
 name: stream-deck-buttons
 description: Add, copy, move or remove Elgato Stream Deck buttons on macOS by editing the saved profile, with a backup first and a check afterwards. Use when someone asks an agent to set up, program or rearrange their Stream Deck keys (open an app or file, open a website, run a shell command, OBS controls). Not for Windows, for building Stream Deck plugins, or for changes that are quicker to drag in the app.
 license: MIT
-compatibility: macOS with the Elgato Stream Deck app 6.x or later (profiles in ProfilesV3). Python 3.8+. The shell-button type needs the free "Shell Commands" plugin.
+compatibility: macOS with the Elgato Stream Deck app 6.x or later (profiles in ProfilesV3). Python 3.8+. The shell-button type needs the "Shell Commands" plugin (paid, one-time; see README).
 metadata:
   version: "1.0.0"
 ---
