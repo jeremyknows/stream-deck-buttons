@@ -206,6 +206,16 @@ class SdeckTest(unittest.TestCase):
         self.assertIn("usable", err)
         self.assertIn("1,1", self.page(FOLDER))
 
+    def test_restore_rejects_backup_missing_a_listed_page(self):
+        bad = os.path.join(self.tmp, "partial")
+        shutil.copytree(self.root, bad)
+        prof = os.path.join(bad, os.path.basename(self.prof))
+        shutil.rmtree(os.path.join(prof, "Profiles", ROOT_PAGE))
+        rc, _, err = self.run_cli("restore", bad)
+        self.assertEqual(rc, 2)
+        self.assertIn("incomplete", err)
+        self.assertIn("3,1", self.page(ROOT_PAGE))
+
     def test_unknown_app_state_fails_closed(self):
         os.environ.pop("SDECK_ASSUME_APP")
         orig = sdeck.subprocess.run

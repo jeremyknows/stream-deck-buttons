@@ -270,8 +270,13 @@ def do_restore(root, src, backups):
         checked = load_profiles(src)
     except (SdeckError, OSError, ValueError) as e:
         raise SdeckError("%s does not look like a usable ProfilesV3 backup (%s)" % (src, e))
-    if not all(p.pages for p in checked):
-        raise SdeckError("%s has a profile with no pages; refusing to restore it" % src)
+    for p in checked:
+        have = {pg.uuid.lower() for pg in p.pages}
+        listed = [u.lower() for u in (p.manifest.get("Pages") or {}).get("Pages", [])]
+        missing = [u for u in listed if u not in have]
+        if not p.pages or missing:
+            raise SdeckError("%s: profile %r is incomplete (%d listed page(s) missing); "
+                             "refusing to restore it" % (src, p.name, len(missing) or 1))
     safety = do_backup(root, backups)
     staging = root + ".sdeck-restore"
     if os.path.exists(staging):
