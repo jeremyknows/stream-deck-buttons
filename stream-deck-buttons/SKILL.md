@@ -66,10 +66,16 @@ OBS actions, Spotify, and anything else.
   copies the file in for you.
 - **Open-action paths must be absolute.** If the target moves, the key breaks; re-add it with `--replace`.
 - **Never copy a folder key.** Two keys would open the same folder. Make folders in the app.
-- **After removing keys, the app warns "error restoring the last session".** It counts keys at quit
-  and compares on the next launch, so fewer keys looks like data loss to it. Adding keys doesn't
-  trigger it. Tell the person beforehand to click **Cancel**: that keeps the new layout, while
-  "Restore" rolls back to the app's own backup. (Verified on app 7.6.1, 2026-11-22.)
+- **"Error restoring the last session" after removing keys.** At quit the app saves a key count
+  (`last_app_session_report.action_count` in the `com.elgato.StreamDeck` defaults: keys on
+  top-level pages only, not folders). On the next launch it compares, and a lower count looks
+  like data loss. Adding keys never triggers it. After `remove` and `restore`, the script lowers
+  that saved count to match the new layout, so the warning shouldn't appear. It never raises the
+  count, and it only lowers it when the app's saved count equals the layout just before the edit
+  (otherwise something else changed the layout, and the app's warning is left on to catch it). If the script prints the fallback note ("saved key count wasn't updated"; this happens
+  off macOS, on failure, or with `SDECK_SKIP_PREFS=1`), tell the person to click **Cancel**. That
+  keeps the new layout, while "Restore" rolls back to the app's own backup. (Verified on app
+  7.6.1, 2026-11-22, with one profile.)
 - **Re-check after an app update.** Elgato can change the saved format. If an edit doesn't stick
   after a relaunch, re-learn the format from a freshly saved button.
 - **OBS "Source Visibility" only toggles,** and it repaints its own icon over custom images. For

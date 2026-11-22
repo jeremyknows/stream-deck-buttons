@@ -3,10 +3,13 @@ import contextlib
 import io
 import json
 import os
+import plistlib
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "stream-deck-buttons", "scripts"))
@@ -59,16 +62,18 @@ def make_tree(base):
     return root, prof
 
 
-class SdeckTest(unittest.TestCase):
+class Base(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
         self.root, self.prof = make_tree(self.tmp)
         self.backups = os.path.join(self.tmp, "backups")
         os.environ["SDECK_ASSUME_APP"] = "stopped"
+        os.environ["SDECK_SKIP_PREFS"] = "1"  # never touch the real app's prefs
 
     def tearDown(self):
         shutil.rmtree(self.tmp)
         os.environ.pop("SDECK_ASSUME_APP", None)
+        os.environ.pop("SDECK_SKIP_PREFS", None)
 
     def run_cli(self, *args):
         out, err = io.StringIO(), io.StringIO()
@@ -80,6 +85,8 @@ class SdeckTest(unittest.TestCase):
         with open(os.path.join(self.prof, "Profiles", uuid_, "manifest.json")) as f:
             return json.load(f)["Controllers"][0]["Actions"]
 
+
+class SdeckTest(Base):
     def test_list_names_root_page_and_folder_by_its_key_title(self):
         rc, out, _ = self.run_cli("list")
         self.assertEqual(rc, 0)
@@ -337,6 +344,147 @@ class SdeckTest(unittest.TestCase):
         self.run_cli("add", "Page 1", "1,0", "--type", "website", "--url", "https://x.test")
         with open(os.path.join(self.prof, "Profiles", ROOT_PAGE, "manifest.json")) as f:
             self.assertIn("\n    ", f.read())
+
+
+class FakeDefaults:
+    """Stands in for subprocess.run, emulating `defaults export/write` on an in-memory domain."""
+
+    def __init__(self, report, fail=False):
+        self.domain = {"other_pref": "keep", sdeck.SESSION_KEY: dict(report)}
+        self.fail = fail
+        self.calls = []
+
+    def __call__(self, cmd, **kw):
+        self.calls.append(cmd)
+        if self.fail:
+            raise OSError("defaults not found")
+        rc, out = 0, b""
+        if cmd[:2] == ["defaults", "export"] and cmd[2] == sdeck.PREFS_DOMAIN:
+            out = plistlib.dumps(self.domain)
+        elif cmd[:2] == ["defaults", "write"] and cmd[2:5] == [sdeck.PREFS_DOMAIN, sdeck.SESSION_KEY,
+                                                               "-dict-add"]:
+            k, typ, v = cmd[5:8]
+            assert typ == "-int"
+            self.domain[sdeck.SESSION_KEY][k] = int(v)
+        else:
+            rc = 1
+        return subprocess.CompletedProcess(cmd, rc, stdout=out)
+
+    def writes(self):
+        return [c for c in self.calls if c[:2] == ["defaults", "write"]]
+
+
+class SessionCountTest(Base):
+    # Fixture: Page 1 has 2 keys (folder opener + shell); the folder has 3 (incl. back key).
+    def setUp(self):
+        super().setUp()
+        os.environ.pop("SDECK_SKIP_PREFS")
+
+    def run_with(self, fake, *args):
+        with mock.patch.object(sdeck.sys, "platform", "darwin"), \
+                mock.patch.object(sdeck.subprocess, "run", fake), \
+                mock.patch.object(sdeck, "DEFAULT_ROOT", self.root):
+            return self.run_cli(*args)
+
+    def test_detached_root_never_touches_prefs(self):
+        fake = FakeDefaults({"action_count": 2, "session_count": 1})
+        with mock.patch.object(sdeck.sys, "platform", "darwin"), \
+                mock.patch.object(sdeck.subprocess, "run", fake):
+            rc, out, err = self.run_cli("remove", "Page 1", "3,1")  # --root is a temp copy
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(fake.calls, [])
+        self.assertIn("isn't the app's live profile folder", out)
+
+    def test_count_includes_pages_but_not_folders(self):
+        self.assertEqual(sdeck.session_action_count(self.root), 2)
+        # A second listed page and an unlisted Default page both count; folders still don't.
+        p2, p3 = "CCCC3333-0000-4000-8000-000000000003", "DDDD4444-0000-4000-8000-000000000004"
+        for u, n in ((p2, 3), (p3, 1)):
+            os.makedirs(os.path.join(self.prof, "Profiles", u))
+            acts = {"%d,0" % i: action("com.elgato.streamdeck.page.next", "Next Page", {})
+                    for i in range(n)}
+            with open(os.path.join(self.prof, "Profiles", u, "manifest.json"), "w") as f:
+                json.dump({"Controllers": [{"Type": "Keypad", "Actions": acts},
+                                           {"Type": "Encoder", "Actions": None}]}, f)
+        mp = os.path.join(self.prof, "manifest.json")
+        with open(mp) as f:
+            m = json.load(f)
+        m["Pages"]["Pages"].append(p2.lower())
+        m["Pages"]["Default"] = p3.lower()
+        with open(mp, "w") as f:
+            json.dump(m, f)
+        self.assertEqual(sdeck.session_action_count(self.root), 2 + 3 + 1)
+
+    def test_remove_lowers_saved_count_and_keeps_other_keys(self):
+        fake = FakeDefaults({"action_count": 2, "session_count": 41})
+        rc, out, err = self.run_with(fake, "remove", "Page 1", "3,1")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(fake.domain[sdeck.SESSION_KEY], {"action_count": 1, "session_count": 41})
+        self.assertEqual(fake.domain["other_pref"], "keep")
+        self.assertEqual(len(fake.writes()), 1)
+        self.assertIn("2 -> 1", out)
+        self.assertNotIn("Cancel", out)
+
+    def test_no_write_when_saved_count_not_higher(self):
+        # Removing a folder key doesn't change the counted total, so stored 2 <= computed 2.
+        for stored in (2, 1):
+            fake = FakeDefaults({"action_count": stored, "session_count": 5})
+            rc, out, err = self.run_with(fake, "remove", "Showtime", "1,1" if stored == 2 else "0,1")
+            self.assertEqual(rc, 0, err)
+            self.assertEqual(fake.writes(), [])
+            self.assertEqual(fake.domain[sdeck.SESSION_KEY]["action_count"], stored)
+            self.assertNotIn("Cancel", out)
+
+    def test_prefs_failure_is_not_fatal(self):
+        fake = FakeDefaults({"action_count": 9, "session_count": 1}, fail=True)
+        rc, out, err = self.run_with(fake, "remove", "Page 1", "3,1")
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn("3,1", self.page(ROOT_PAGE))
+        self.assertIn("couldn't check", out)
+        self.assertIn("Cancel", out)
+
+    def test_missing_report_falls_back_to_note(self):
+        fake = FakeDefaults({})
+        del fake.domain[sdeck.SESSION_KEY]
+        rc, out, _ = self.run_with(fake, "remove", "Page 1", "3,1")
+        self.assertEqual(rc, 0)
+        self.assertEqual(fake.writes(), [])
+        self.assertIn("Cancel", out)
+
+    def test_skipped_off_macos_and_with_env(self):
+        fake = FakeDefaults({"action_count": 9, "session_count": 1})
+        with mock.patch.object(sdeck.sys, "platform", "linux"), \
+                mock.patch.object(sdeck.subprocess, "run", fake):
+            self.assertFalse(sdeck.sync_session_count(self.root, 9))
+        os.environ["SDECK_SKIP_PREFS"] = "1"
+        with mock.patch.object(sdeck.sys, "platform", "darwin"), \
+                mock.patch.object(sdeck.subprocess, "run", fake):
+            self.assertFalse(sdeck.sync_session_count(self.root, 9))
+        self.assertEqual(fake.calls, [])
+
+    def test_mismatched_saved_count_is_left_alone(self):
+        # App saved 5 but the layout had 2 before this edit: something else changed it, so the
+        # app's own data-loss check must not be silenced.
+        fake = FakeDefaults({"action_count": 5, "session_count": 1})
+        rc, out, err = self.run_with(fake, "remove", "Page 1", "3,1")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(fake.writes(), [])
+        self.assertIn("doesn't match", out)
+        self.assertIn("Cancel", out)
+
+    def test_restore_lowers_saved_count(self):
+        os.environ["SDECK_SKIP_PREFS"] = "1"
+        self.run_cli("backup")  # full layout: 2 page keys
+        full = os.path.join(self.backups, sorted(os.listdir(self.backups))[-1])
+        self.run_cli("remove", "Page 1", "3,1")
+        self.run_cli("backup")  # 1 page key
+        snap = os.path.join(self.backups, sorted(os.listdir(self.backups))[-1])
+        self.run_cli("restore", full)  # live is back to 2, matching the app's saved 2
+        os.environ.pop("SDECK_SKIP_PREFS")
+        fake = FakeDefaults({"action_count": 2, "session_count": 3})
+        rc, out, err = self.run_with(fake, "restore", snap)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(fake.domain[sdeck.SESSION_KEY], {"action_count": 1, "session_count": 3})
 
 
 if __name__ == "__main__":
