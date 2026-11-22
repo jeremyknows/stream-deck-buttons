@@ -239,6 +239,100 @@ class SdeckTest(unittest.TestCase):
         self.assertIn("would_remove", out)
         self.assertIn("1,1", self.page(FOLDER))
 
+    def make_old_backups(self, n):
+        os.makedirs(self.backups, exist_ok=True)
+        names = ["ProfilesV3-202601%02d-120000" % (i + 1) for i in range(n)]
+        for name in names:
+            shutil.copytree(self.root, os.path.join(self.backups, name))
+        return names
+
+    def test_backups_pruned_to_keep_newest(self):
+        self.make_old_backups(12)
+        os.makedirs(os.path.join(self.backups, "my-own-copy"))  # not ours: never touched
+        rc, out, err = self.run_cli("backup")
+        self.assertEqual(rc, 0, err)
+        left = sorted(os.listdir(self.backups))
+        ours = [n for n in left if n.startswith("ProfilesV3-")]
+        self.assertEqual(len(ours), 10)
+        self.assertIn(os.path.basename(out.strip()), ours)  # the new one survives
+        self.assertNotIn("ProfilesV3-20260101-120000", ours)
+        self.assertIn("my-own-copy", left)
+
+    def test_keep_zero_keeps_all(self):
+        self.make_old_backups(12)
+        rc, _, err = self.run_cli("--keep-backups", "0", "backup")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(len(os.listdir(self.backups)), 13)
+
+    def test_restore_from_oldest_backup_is_not_pruned_away(self):
+        # 10 backups at the keep limit; restore's own safety backup makes 11, and the
+        # backup being restored from is the oldest, so plain pruning would delete it.
+        names = self.make_old_backups(10)
+        oldest = os.path.join(self.backups, names[0])
+        rc, _, err = self.run_cli("remove", "Showtime", "1,1", "--no-backup")
+        self.assertEqual(rc, 0, err)
+        rc, _, err = self.run_cli("restore", oldest)
+        self.assertEqual(rc, 0, err)
+        self.assertIn("1,1", self.page(FOLDER))
+        self.assertTrue(os.path.isdir(oldest))
+
+    def test_restore_source_given_as_subfolder_survives_pruning(self):
+        names = self.make_old_backups(10)
+        src = os.path.join(self.backups, names[0]) + "/"
+        rc, _, err = self.run_cli("restore", src)
+        self.assertEqual(rc, 0, err)
+        self.assertTrue(os.path.isdir(src))
+
+    def test_live_root_inside_backups_is_never_pruned(self):
+        store = os.path.join(self.tmp, "store")
+        live = os.path.join(store, "ProfilesV3-20200101-000000")
+        shutil.copytree(self.root, live)
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = sdeck.main(["--root", live, "--backups", store, "--keep-backups", "1", "backup"])
+        self.assertEqual(rc, 0, err.getvalue())
+        self.assertTrue(os.path.isdir(live))
+
+    def test_same_second_backups_stay_ordered(self):
+        for _ in range(5):
+            self.run_cli("--keep-backups", "2", "backup")
+        left = sorted(os.listdir(self.backups))
+        self.assertEqual(len(left), 2)
+
+    def test_name_with_trailing_newline_is_not_ours(self):
+        os.makedirs(self.backups)
+        odd = os.path.join(self.backups, "ProfilesV3-20200101-000000\n")
+        os.makedirs(odd)
+        self.run_cli("--keep-backups", "1", "backup")
+        self.assertTrue(os.path.isdir(odd))
+
+    def test_failed_copy_leaves_no_backup(self):
+        orig = sdeck.shutil.copytree
+        def boom(src, dst, *a, **k):
+            os.makedirs(dst)
+            raise OSError("disk full")
+        sdeck.shutil.copytree = boom
+        try:
+            rc, _, err = self.run_cli("backup")
+        finally:
+            sdeck.shutil.copytree = orig
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(os.listdir(self.backups), [])
+
+    def test_symlinked_backup_name_is_ignored(self):
+        self.make_old_backups(1)
+        os.symlink(self.root, os.path.join(self.backups, "ProfilesV3-19990101-000000"))
+        rc, _, err = self.run_cli("--keep-backups", "1", "backup")
+        self.assertEqual(rc, 0, err)
+        self.assertTrue(os.path.islink(os.path.join(self.backups, "ProfilesV3-19990101-000000")))
+
+    def test_backups_lists_sizes(self):
+        self.make_old_backups(2)
+        rc, out, _ = self.run_cli("backups")
+        self.assertEqual(rc, 0)
+        self.assertIn("2 backup(s)", out)
+        self.assertIn("MB", out)
+
     def test_saved_indentation_is_kept(self):
         self.run_cli("add", "Page 1", "1,0", "--type", "website", "--url", "https://x.test")
         with open(os.path.join(self.prof, "Profiles", ROOT_PAGE, "manifest.json")) as f:

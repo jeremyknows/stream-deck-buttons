@@ -31,7 +31,9 @@ Tell the person before you quit the app. Their deck goes dark for a few seconds.
    folders take the title of the key that opens them (e.g. `Showtime`). Slots are `col,row`, with
    `0,0` at the top-left key. A standard deck is 5×3, a Mini is 3×2, an XL is 8×4, a Neo or + is 4×2.
 2. **Confirm the plan** with the person: page, slot, what the key does, and its title.
-3. **Make the change.** Every edit backs up the whole profile folder to `~/StreamDeckBackups/` first.
+3. **Make the change.** Every edit backs up the whole profile folder to `~/StreamDeckBackups/` first,
+   and only the newest 10 backups are kept (`--keep-backups N`, or `0` to keep all; `sdeck.py backups`
+   lists them with sizes). Folders you put there yourself are never touched.
    ```
    sdeck.py add "Page 1" 2,0 --type website --url https://example.com --title Docs
    sdeck.py add "Page 1" 3,0 --type open --path "/Applications/OBS.app" --title OBS

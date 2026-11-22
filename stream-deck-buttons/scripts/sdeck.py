@@ -12,6 +12,7 @@ Standard library only. Python 3.8+.
   sdeck.py show PAGE SLOT                  one button's saved JSON (learn a format)
   sdeck.py quit | launch | status          control the app
   sdeck.py backup                          copy ProfilesV3 somewhere safe
+  sdeck.py backups                         list backups with sizes (newest 10 are kept)
   sdeck.py restore BACKUP_DIR              put a backup back (backs up current first)
   sdeck.py add PAGE SLOT --type open|website|shell ...
   sdeck.py copy FROM_PAGE FROM_SLOT TO_PAGE TO_SLOT [--title T] [--set key=value]
@@ -257,19 +258,72 @@ def describe(action):
 
 # ---------------------------------------------------------------- backup/restore
 
-def do_backup(root, backups):
-    stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-    dest = os.path.join(backups, "ProfilesV3-" + stamp)
-    n = 1
+# ProfilesV3-YYYYMMDD-HHMMSS-ffffff (microseconds keep same-second backups ordered).
+BACKUP_RE = re.compile(r"ProfilesV3-(\d{8}-\d{6})(?:-(\d{1,6}))?")
+DEFAULT_KEEP = 10
+
+
+def list_backups(backups):
+    if not os.path.isdir(backups):
+        return []
+    names = [n for n in os.listdir(backups)
+             if BACKUP_RE.fullmatch(n) and os.path.isdir(os.path.join(backups, n))
+             and not os.path.islink(os.path.join(backups, n))]  # never follow links
+    def order(n):
+        m = BACKUP_RE.fullmatch(n)
+        return (m.group(1), int(m.group(2) or 0))
+    return [os.path.join(backups, n) for n in sorted(names, key=order)]  # oldest first
+
+
+def dir_size(path):
+    total = 0
+    for dp, _, files in os.walk(path):
+        for f in files:
+            try:
+                total += os.path.getsize(os.path.join(dp, f))
+            except OSError:
+                pass
+    return total
+
+
+def prune_backups(backups, keep, protect=()):
+    """Delete the oldest sdeck backups beyond `keep`. Only touches folders this tool named."""
+    if keep <= 0:
+        return []
+    protect = [os.path.realpath(p) for p in protect]
+    victims = list_backups(backups)[:-keep]
+    removed = []
+    for v in victims:
+        rv = os.path.realpath(v)
+        # Skip anything that is, contains, or sits inside a protected path
+        # (the new backup, a restore source given as a subfolder, the live profiles).
+        if any(os.path.commonpath([rv, p]) in (rv, p) for p in protect):
+            continue
+        shutil.rmtree(v)
+        removed.append(v)
+    return removed
+
+
+def do_backup(root, backups, keep=DEFAULT_KEEP, protect=()):
+    now = dt.datetime.now()
+    dest = os.path.join(backups, "ProfilesV3-" + now.strftime("%Y%m%d-%H%M%S-%f"))
     while os.path.exists(dest):
-        n += 1
-        dest = os.path.join(backups, "ProfilesV3-%s-%d" % (stamp, n))
+        now += dt.timedelta(microseconds=1)
+        dest = os.path.join(backups, "ProfilesV3-" + now.strftime("%Y%m%d-%H%M%S-%f"))
     os.makedirs(backups, exist_ok=True)
-    shutil.copytree(root, dest)
+    # Copy under a name pruning ignores, then rename: a failed copy never counts as a backup.
+    partial = os.path.join(backups, ".partial-" + os.path.basename(dest))
+    try:
+        shutil.copytree(root, partial)
+        os.rename(partial, dest)
+    except BaseException:
+        shutil.rmtree(partial, ignore_errors=True)
+        raise
+    prune_backups(backups, keep, protect=tuple(protect) + (dest, root))
     return dest
 
 
-def do_restore(root, src, backups):
+def do_restore(root, src, backups, keep=DEFAULT_KEEP):
     try:
         checked = load_profiles(src)
     except (SdeckError, OSError, ValueError) as e:
@@ -281,7 +335,7 @@ def do_restore(root, src, backups):
         if not p.pages or missing:
             raise SdeckError("%s: profile %r is incomplete (%d listed page(s) missing); "
                              "refusing to restore it" % (src, p.name, len(missing) or 1))
-    safety = do_backup(root, backups)
+    safety = do_backup(root, backups, keep, protect=(src,))
     staging = root + ".sdeck-restore"
     if os.path.exists(staging):
         shutil.rmtree(staging)
@@ -426,7 +480,7 @@ def cmd_show(a):
 def edit_prelude(a):
     require_quit()
     if not a.no_backup:
-        print("backup: %s" % do_backup(a.root, a.backups))
+        print("backup: %s" % do_backup(a.root, a.backups, a.keep_backups))
 
 
 def cmd_add(a):
@@ -503,12 +557,25 @@ def cmd_remove(a):
 
 
 def cmd_backup(a):
-    print(do_backup(a.root, a.backups))
+    print(do_backup(a.root, a.backups, a.keep_backups))
+
+
+def cmd_backups(a):
+    items = list_backups(a.backups)
+    total = 0
+    for b in items:
+        size = dir_size(b)
+        total += size
+        print("%8.1f MB  %s" % (size / 1e6, b))
+    print("%d backup(s), %.1f MB total in %s (keeping the newest %s)"
+          % (len(items), total / 1e6, a.backups,
+             a.keep_backups if a.keep_backups > 0 else "all"))
 
 
 def cmd_restore(a):
     require_quit()
-    print("current state saved to %s first" % do_restore(a.root, a.backup_dir, a.backups))
+    print("current state saved to %s first"
+          % do_restore(a.root, a.backup_dir, a.backups, a.keep_backups))
     print("restored %s. Run `sdeck.py launch`." % a.backup_dir)
     print(COUNT_NOTE.replace("Because this lowers", "If the restored layout has fewer keys, it lowers")
           .replace("it will show", "and the app will show"))
@@ -532,13 +599,17 @@ def main(argv=None):
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--root", default=os.environ.get("STREAMDECK_PROFILES_DIR", DEFAULT_ROOT))
     ap.add_argument("--backups", default=os.environ.get("SDECK_BACKUP_DIR", DEFAULT_BACKUPS))
+    ap.add_argument("--keep-backups", type=int,
+                    default=int(os.environ.get("SDECK_KEEP_BACKUPS", DEFAULT_KEEP)),
+                    help="how many sdeck backups to keep, newest first (0 = keep all)")
     ap.add_argument("--profile")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("locate").set_defaults(fn=cmd_locate)
     p = sub.add_parser("list"); p.add_argument("--uuids", action="store_true"); p.set_defaults(fn=cmd_list)
     p = sub.add_parser("show"); p.add_argument("page"); p.add_argument("slot"); p.set_defaults(fn=cmd_show)
-    for n, fn in (("quit", cmd_quit), ("launch", cmd_launch), ("status", cmd_status), ("backup", cmd_backup)):
+    for n, fn in (("quit", cmd_quit), ("launch", cmd_launch), ("status", cmd_status), ("backup", cmd_backup),
+                  ("backups", cmd_backups)):
         sub.add_parser(n).set_defaults(fn=fn)
     p = sub.add_parser("restore"); p.add_argument("backup_dir"); p.set_defaults(fn=cmd_restore)
 
@@ -571,6 +642,9 @@ def main(argv=None):
     except SdeckError as e:
         print("error: %s" % e, file=sys.stderr)
         return 2
+    except OSError as e:
+        print("error: %s" % e, file=sys.stderr)
+        return 1
     return 0
 
 
