@@ -64,6 +64,10 @@ OBS actions, Spotify, and anything else.
   copies the file in for you.
 - **Open-action paths must be absolute.** If the target moves, the key breaks; re-add it with `--replace`.
 - **Never copy a folder key.** Two keys would open the same folder. Make folders in the app.
+- **After removing keys, the app warns "error restoring the last session".** It counts keys at quit
+  and compares on the next launch, so fewer keys looks like data loss to it. Adding keys doesn't
+  trigger it. Tell the person beforehand to click **Cancel**: that keeps the new layout, while
+  "Restore" rolls back to the app's own backup. (Verified on app 7.6.1, 2026-11-22.)
 - **Re-check after an app update.** Elgato can change the saved format. If an edit doesn't stick
   after a relaunch, re-learn the format from a freshly saved button.
 - **OBS "Source Visibility" only toggles,** and it repaints its own icon over custom images. For

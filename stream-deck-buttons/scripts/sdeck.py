@@ -49,6 +49,10 @@ SHELL_ACTION = "com.ceylon-systems.shell-commands.runner"
 FOLDER_ACTIONS = ("com.elgato.streamdeck.profile.openchild",)
 SLOT_RE = re.compile(r"^\d+,\d+$")
 
+COUNT_NOTE = ("note: the app counts keys at quit and compares on the next launch. Because this "
+              "lowers the count, it will show 'error restoring the last session' and offer its "
+              "own backup. Click Cancel to keep this layout; nothing was lost.")
+
 
 class SdeckError(Exception):
     pass
@@ -495,6 +499,7 @@ def cmd_remove(a):
     del acts[slot]
     page.save()
     print("removed %s from %r" % (slot, page.name))
+    print(COUNT_NOTE)
 
 
 def cmd_backup(a):
@@ -505,6 +510,8 @@ def cmd_restore(a):
     require_quit()
     print("current state saved to %s first" % do_restore(a.root, a.backup_dir, a.backups))
     print("restored %s. Run `sdeck.py launch`." % a.backup_dir)
+    print(COUNT_NOTE.replace("Because this lowers", "If the restored layout has fewer keys, it lowers")
+          .replace("it will show", "and the app will show"))
 
 
 def cmd_quit(a):
