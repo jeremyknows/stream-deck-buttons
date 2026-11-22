@@ -29,6 +29,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 
@@ -58,8 +59,14 @@ class SdeckError(Exception):
 def app_running():
     if os.environ.get("SDECK_ASSUME_APP") in ("running", "stopped"):  # tests
         return os.environ["SDECK_ASSUME_APP"] == "running"
-    r = subprocess.run(["pgrep", "-f", APP_NAME + ".app/Contents/MacOS"],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        r = subprocess.run(["pgrep", "-f", APP_NAME + ".app/Contents/MacOS"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError as e:
+        raise SdeckError("Can't tell whether the Stream Deck app is running (%s)" % e)
+    if r.returncode not in (0, 1):  # fail closed: unknown means "maybe running"
+        raise SdeckError("Can't tell whether the Stream Deck app is running (pgrep exit %d). "
+                         "Quit it by hand and set SDECK_ASSUME_APP=stopped." % r.returncode)
     return r.returncode == 0
 
 
@@ -100,11 +107,18 @@ def write_json_atomic(path, data, like=None):
     if like is not None:
         with open(like, encoding="utf-8") as f:
             indent = 4 if "\n" in f.read(4096) else None
-    tmp = path + ".sdeck-tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=indent, ensure_ascii=False)
-    read_json(tmp)  # must parse before it replaces anything
-    os.replace(tmp, path)
+    fd, tmp = tempfile.mkstemp(prefix=".sdeck-", suffix=".json", dir=os.path.dirname(path))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=indent, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        read_json(tmp)  # must parse before it replaces anything
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
 
 
 class Page:
@@ -155,15 +169,19 @@ class Profile:
             if u in by_uuid:
                 by_uuid[u].kind = "page"
                 by_uuid[u].name = "Page %d" % i
-        # A folder is named by the key that opens it: any parent action whose
-        # Settings mention the folder's UUID (key name varies by app version).
-        for parent in self.pages:
-            for slot, a in parent.keypad().items():
-                vals = json.dumps(a.get("Settings") or {}).lower()
-                for p in self.pages:
-                    if p.kind == "folder" and p.name is None and p.uuid.lower() in vals:
-                        p.name = title_of(a) or ("Folder " + p.uuid[:8])
-                        p.parent = (parent, slot)
+        # A folder is named by the key that opens it. Prefer real folder-opener actions;
+        # fall back to any action whose Settings mention the folder's UUID (the opener's
+        # UUID and settings key have varied across app versions).
+        for openers_only in (True, False):
+            for parent in self.pages:
+                for slot, a in parent.keypad().items():
+                    if openers_only and a.get("UUID") not in FOLDER_ACTIONS:
+                        continue
+                    vals = json.dumps(a.get("Settings") or {}).lower()
+                    for p in self.pages:
+                        if p.kind == "folder" and p.name is None and p.uuid.lower() in vals:
+                            p.name = title_of(a) or ("Folder " + p.uuid[:8])
+                            p.parent = (parent, slot)
         for p in self.pages:
             if p.name is None:
                 p.name = (p.data.get("Name") or "").strip() or ("Unlinked " + p.uuid[:8])
@@ -210,10 +228,14 @@ def pick_profile(profiles, name):
             return profiles[0]
         raise SdeckError("Several profiles exist; pass --profile. Names: "
                          + ", ".join(p.name for p in profiles))
-    for p in profiles:
-        if p.name.lower() == name.lower() or os.path.basename(p.dir).lower().startswith(name.lower()):
-            return p
-    raise SdeckError("No profile named %r" % name)
+    hits = [p for p in profiles if p.name.lower() == name.lower()
+            or os.path.basename(p.dir).lower().startswith(name.lower())]
+    if len(hits) > 1:
+        raise SdeckError("%d profiles match %r; pass the folder name from `locate` instead: %s"
+                         % (len(hits), name, ", ".join(os.path.basename(p.dir) for p in hits)))
+    if not hits:
+        raise SdeckError("No profile named %r" % name)
+    return hits[0]
 
 
 def check_slot(slot):
@@ -244,8 +266,12 @@ def do_backup(root, backups):
 
 
 def do_restore(root, src, backups):
-    if not os.path.isdir(src) or not any(n.endswith(".sdProfile") for n in os.listdir(src)):
-        raise SdeckError("%s does not look like a ProfilesV3 backup" % src)
+    try:
+        checked = load_profiles(src)
+    except (SdeckError, OSError, ValueError) as e:
+        raise SdeckError("%s does not look like a usable ProfilesV3 backup (%s)" % (src, e))
+    if not all(p.pages for p in checked):
+        raise SdeckError("%s has a profile with no pages; refusing to restore it" % src)
     safety = do_backup(root, backups)
     staging = root + ".sdeck-restore"
     if os.path.exists(staging):
@@ -255,7 +281,11 @@ def do_restore(root, src, backups):
     if os.path.exists(old):
         shutil.rmtree(old)
     os.rename(root, old)
-    os.rename(staging, root)
+    try:
+        os.rename(staging, root)
+    except BaseException:
+        os.rename(old, root)  # put the live profiles back before reporting the failure
+        raise
     shutil.rmtree(old)
     return safety
 
@@ -315,7 +345,8 @@ def attach_image(page, action, image):
     os.makedirs(images, exist_ok=True)
     fname = "sdeck-%s.png" % uuid.uuid4().hex[:12]
     shutil.copyfile(src, os.path.join(images, fname))
-    action["States"][0]["Image"] = "Images/" + fname
+    for state in action.setdefault("States", [{}]):
+        state["Image"] = "Images/" + fname
 
 
 def parse_sets(pairs):
@@ -333,6 +364,9 @@ def parse_sets(pairs):
 
 def place(page, slot, action, replace):
     actions = page.keypad(create=True)
+    if slot in actions and actions[slot].get("UUID") in FOLDER_ACTIONS:
+        raise SdeckError("Slot %s on %r opens a folder; replacing it would strand that folder's "
+                         "keys. Pick another slot." % (slot, page.name))
     if slot in actions and not replace:
         u, d = describe(actions[slot])
         raise SdeckError("Slot %s on %r is taken (%s %s). Pick an empty slot or pass --replace."
@@ -449,6 +483,9 @@ def cmd_remove(a):
         raise SdeckError("Slot %s on %r is already empty" % (slot, page.name))
     if acts[slot].get("UUID") in FOLDER_ACTIONS:
         raise SdeckError("That key opens a folder; remove folders in the app.")
+    if a.dry_run:
+        print(json.dumps({"page": page.name, "slot": slot, "would_remove": acts[slot]}, indent=2))
+        return
     edit_prelude(a)
     del acts[slot]
     page.save()
@@ -513,7 +550,8 @@ def main(argv=None):
     edit_flags(p); p.set_defaults(fn=cmd_copy)
 
     p = sub.add_parser("remove"); p.add_argument("page"); p.add_argument("slot")
-    p.add_argument("--no-backup", action="store_true"); p.set_defaults(fn=cmd_remove)
+    p.add_argument("--no-backup", action="store_true")
+    p.add_argument("--dry-run", action="store_true"); p.set_defaults(fn=cmd_remove)
 
     a = ap.parse_args(argv)
     try:

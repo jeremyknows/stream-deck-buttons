@@ -176,6 +176,58 @@ class SdeckTest(unittest.TestCase):
         self.assertEqual(rc, 2)
         self.assertIn("Known:", err)
 
+    def test_replace_refuses_folder_opener(self):
+        rc, _, err = self.run_cli("add", "Page 1", "0,0", "--type", "website",
+                                  "--url", "https://x.test", "--replace")
+        self.assertEqual(rc, 2)
+        self.assertIn("opens a folder", err)
+        self.assertEqual(self.page(ROOT_PAGE)["0,0"]["Settings"]["ProfileUUID"], FOLDER.lower())
+
+    def test_folder_named_by_opener_not_by_other_mentions(self):
+        # A shell key that happens to mention the folder UUID must not steal its name.
+        p = os.path.join(self.prof, "Profiles", ROOT_PAGE, "manifest.json")
+        with open(p) as f:
+            data = json.load(f)
+        data["Controllers"][0]["Actions"]["0,0"]["States"][0]["Title"] = "Showtime"
+        data["Controllers"][0]["Actions"]["1,0"] = action(
+            "com.ceylon-systems.shell-commands.runner", "Runner",
+            {"commandToRun": "echo %s" % FOLDER}, title="Decoy")
+        with open(p, "w") as f:
+            json.dump(data, f)
+        rc, out, _ = self.run_cli("list")
+        self.assertIn("Showtime [folder]", out)
+        self.assertNotIn("Decoy [folder]", out)
+
+    def test_restore_rejects_empty_backup(self):
+        bad = os.path.join(self.tmp, "bad")
+        os.makedirs(os.path.join(bad, "X.sdProfile"))
+        rc, _, err = self.run_cli("restore", bad)
+        self.assertEqual(rc, 2)
+        self.assertIn("usable", err)
+        self.assertIn("1,1", self.page(FOLDER))
+
+    def test_unknown_app_state_fails_closed(self):
+        os.environ.pop("SDECK_ASSUME_APP")
+        orig = sdeck.subprocess.run
+
+        class R:
+            returncode = 3
+        sdeck.subprocess.run = lambda *a, **k: R()
+        try:
+            rc, _, err = self.run_cli("add", "Page 1", "1,0", "--type", "website",
+                                      "--url", "https://x.test")
+        finally:
+            sdeck.subprocess.run = orig
+        self.assertEqual(rc, 2)
+        self.assertIn("Can't tell", err)
+        self.assertNotIn("1,0", self.page(ROOT_PAGE))
+
+    def test_remove_dry_run(self):
+        rc, out, _ = self.run_cli("remove", "Showtime", "1,1", "--dry-run")
+        self.assertEqual(rc, 0)
+        self.assertIn("would_remove", out)
+        self.assertIn("1,1", self.page(FOLDER))
+
     def test_saved_indentation_is_kept(self):
         self.run_cli("add", "Page 1", "1,0", "--type", "website", "--url", "https://x.test")
         with open(os.path.join(self.prof, "Profiles", ROOT_PAGE, "manifest.json")) as f:
