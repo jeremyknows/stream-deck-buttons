@@ -71,7 +71,8 @@ OBS actions, Spotify, and anything else.
   top-level pages only, not folders). On the next launch it compares, and a lower count looks
   like data loss. Adding keys never triggers it. After `remove` and `restore`, the script lowers
   that saved count to match the new layout, so the warning shouldn't appear. It never raises the
-  count. If the script prints the fallback note ("saved key count wasn't updated"; this happens
+  count, and it only lowers it when the app's saved count equals the layout just before the edit
+  (otherwise something else changed the layout, and the app's warning is left on to catch it). If the script prints the fallback note ("saved key count wasn't updated"; this happens
   off macOS, on failure, or with `SDECK_SKIP_PREFS=1`), tell the person to click **Cancel**. That
   keeps the new layout, while "Restore" rolls back to the app's own backup. (Verified on app
   7.6.1, 2026-11-22, with one profile.)

@@ -382,8 +382,18 @@ class SessionCountTest(Base):
 
     def run_with(self, fake, *args):
         with mock.patch.object(sdeck.sys, "platform", "darwin"), \
-                mock.patch.object(sdeck.subprocess, "run", fake):
+                mock.patch.object(sdeck.subprocess, "run", fake), \
+                mock.patch.object(sdeck, "DEFAULT_ROOT", self.root):
             return self.run_cli(*args)
+
+    def test_detached_root_never_touches_prefs(self):
+        fake = FakeDefaults({"action_count": 2, "session_count": 1})
+        with mock.patch.object(sdeck.sys, "platform", "darwin"), \
+                mock.patch.object(sdeck.subprocess, "run", fake):
+            rc, out, err = self.run_cli("remove", "Page 1", "3,1")  # --root is a temp copy
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(fake.calls, [])
+        self.assertIn("isn't the app's live profile folder", out)
 
     def test_count_includes_pages_but_not_folders(self):
         self.assertEqual(sdeck.session_action_count(self.root), 2)
@@ -445,18 +455,31 @@ class SessionCountTest(Base):
         fake = FakeDefaults({"action_count": 9, "session_count": 1})
         with mock.patch.object(sdeck.sys, "platform", "linux"), \
                 mock.patch.object(sdeck.subprocess, "run", fake):
-            self.assertFalse(sdeck.sync_session_count(self.root))
+            self.assertFalse(sdeck.sync_session_count(self.root, 9))
         os.environ["SDECK_SKIP_PREFS"] = "1"
         with mock.patch.object(sdeck.sys, "platform", "darwin"), \
                 mock.patch.object(sdeck.subprocess, "run", fake):
-            self.assertFalse(sdeck.sync_session_count(self.root))
+            self.assertFalse(sdeck.sync_session_count(self.root, 9))
         self.assertEqual(fake.calls, [])
+
+    def test_mismatched_saved_count_is_left_alone(self):
+        # App saved 5 but the layout had 2 before this edit: something else changed it, so the
+        # app's own data-loss check must not be silenced.
+        fake = FakeDefaults({"action_count": 5, "session_count": 1})
+        rc, out, err = self.run_with(fake, "remove", "Page 1", "3,1")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(fake.writes(), [])
+        self.assertIn("doesn't match", out)
+        self.assertIn("Cancel", out)
 
     def test_restore_lowers_saved_count(self):
         os.environ["SDECK_SKIP_PREFS"] = "1"
+        self.run_cli("backup")  # full layout: 2 page keys
+        full = os.path.join(self.backups, sorted(os.listdir(self.backups))[-1])
         self.run_cli("remove", "Page 1", "3,1")
-        self.run_cli("backup")
+        self.run_cli("backup")  # 1 page key
         snap = os.path.join(self.backups, sorted(os.listdir(self.backups))[-1])
+        self.run_cli("restore", full)  # live is back to 2, matching the app's saved 2
         os.environ.pop("SDECK_SKIP_PREFS")
         fake = FakeDefaults({"action_count": 2, "session_count": 3})
         rc, out, err = self.run_with(fake, "restore", snap)

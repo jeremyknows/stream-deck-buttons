@@ -380,10 +380,25 @@ def session_action_count(root):
     return n
 
 
-def sync_session_count(root):
+def safe_count(root):
+    try:
+        return session_action_count(root)
+    except Exception:
+        return None
+
+
+def sync_session_count(root, before):
     """Lower the app's saved key count to match the edited profiles so it doesn't report data
-    loss on launch. Never raises the count and never raises. True if nothing is left to do."""
+    loss on launch. Never raises the count and never raises. True if nothing is left to do.
+
+    `before` is the count computed from disk just before this edit. The app's saved count must
+    equal it; otherwise the layout changed some other way since the app last quit (or our counting
+    rule is wrong for this app version), and silencing the app's data-loss check would hide that."""
     if os.environ.get("SDECK_SKIP_PREFS") == "1" or sys.platform != "darwin":
+        return False
+    if os.path.realpath(root) != os.path.realpath(DEFAULT_ROOT):
+        # The prefs belong to the app's live profiles; editing a copy must not move them.
+        print("note: --root isn't the app's live profile folder, so its saved key count was left alone.")
         return False
     try:
         new = session_action_count(root)
@@ -397,6 +412,10 @@ def sync_session_count(root):
             raise SdeckError("no %s.action_count saved" % SESSION_KEY)
         if old <= new:
             return True
+        if before is None or old != before:
+            print("note: the app's saved key count (%s) doesn't match this layout before the edit "
+                  "(%s), so it was left alone." % (old, before))
+            return False
         # -dict-add sets one key and keeps session_count and anything else in the dict.
         r = subprocess.run(["defaults", "write", PREFS_DOMAIN, SESSION_KEY,
                             "-dict-add", "action_count", "-int", str(new)],
@@ -607,10 +626,11 @@ def cmd_remove(a):
         print(json.dumps({"page": page.name, "slot": slot, "would_remove": acts[slot]}, indent=2))
         return
     edit_prelude(a)
+    before = safe_count(a.root)
     del acts[slot]
     page.save()
     print("removed %s from %r" % (slot, page.name))
-    if not sync_session_count(a.root):
+    if not sync_session_count(a.root, before):
         print(COUNT_NOTE)
 
 
@@ -632,10 +652,11 @@ def cmd_backups(a):
 
 def cmd_restore(a):
     require_quit()
+    before = safe_count(a.root)
     print("current state saved to %s first"
           % do_restore(a.root, a.backup_dir, a.backups, a.keep_backups))
     print("restored %s. Run `sdeck.py launch`." % a.backup_dir)
-    if not sync_session_count(a.root):
+    if not sync_session_count(a.root, before):
         print(COUNT_NOTE)
 
 
